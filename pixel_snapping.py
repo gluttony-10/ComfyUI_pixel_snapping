@@ -182,8 +182,8 @@ class PixelSnappingNode:
             src_pts = np.float32([kp2[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)  # type: ignore
             dst_pts = np.float32([kp1[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)  # type: ignore
             
-            # 使用RANSAC估计仿射变换矩阵
-            affine_matrix, ransac_mask = cv2.estimateAffinePartial2D(
+            # 使用RANSAC估计仿射变换矩阵（完整仿射变换，支持非均匀缩放和剪切）
+            affine_matrix, ransac_mask = cv2.estimateAffine2D(
                 src_pts, 
                 dst_pts, 
                 method=cv2.RANSAC,
@@ -200,6 +200,45 @@ class PixelSnappingNode:
             
             inliers = np.sum(ransac_mask)
             print(f"RANSAC内点数量: {inliers}/{len(good_matches)}")
+            
+            # 【优化】基于重投影误差过滤低质量匹配点后重新计算
+            inlier_mask = ransac_mask.ravel() == 1
+            src_inliers = src_pts[inlier_mask]
+            dst_inliers = dst_pts[inlier_mask]
+            
+            # 计算所有内点的重投影误差
+            transformed = cv2.transform(src_inliers, affine_matrix)
+            errors = np.linalg.norm(transformed - dst_inliers, axis=2).ravel()
+            
+            # 只保留误差最小的80%点
+            threshold_80 = np.percentile(errors, 80)
+            good_mask = errors <= threshold_80
+            refined_count = np.sum(good_mask)
+            
+            print(f"🔧 重投影误差过滤: 保留{refined_count}/{inliers}个最优内点 (80%分位)")
+            
+            # 用最优点重新计算仿射矩阵
+            if refined_count >= 3:  # 至少需要3个点
+                src_pts_refined = src_inliers[good_mask]
+                dst_pts_refined = dst_inliers[good_mask]
+                affine_matrix_refined, _ = cv2.estimateAffine2D(
+                    src_pts_refined, 
+                    dst_pts_refined,
+                    method=cv2.LMEDS  # 使用最小中值法，对离群点更鲁棒
+                )
+                
+                if affine_matrix_refined is not None:
+                    affine_matrix = affine_matrix_refined
+                    print("✓ 已使用精化后的仿射矩阵")
+            
+            # 更新ransac_mask和src_pts/dst_pts以便后续使用
+            if refined_count >= 3:
+                # 重建完整的mask和点集（用于后续的包围框计算）
+                temp_mask = np.zeros(len(good_matches), dtype=bool)
+                inlier_indices = np.where(inlier_mask)[0]
+                refined_indices = inlier_indices[good_mask]
+                temp_mask[refined_indices] = True
+                ransac_mask = temp_mask.reshape(-1, 1).astype(np.uint8)
             
             # 只使用RANSAC内点计算包围框
             inlier_mask = ransac_mask.ravel() == 1
@@ -312,8 +351,8 @@ class PixelSnappingNode:
                 src_pts = np.float32([kp2[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)  # type: ignore
                 dst_pts = np.float32([kp1[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)  # type: ignore
                 
-                # 重新计算RANSAC仿射变换矩阵
-                affine_matrix, ransac_mask = cv2.estimateAffinePartial2D(
+                # 重新计算RANSAC仿射变换矩阵（完整仿射变换）
+                affine_matrix, ransac_mask = cv2.estimateAffine2D(
                     src_pts, 
                     dst_pts, 
                     method=cv2.RANSAC,
@@ -323,6 +362,46 @@ class PixelSnappingNode:
                 if affine_matrix is None:
                     print("⚠️ 警告: 修正后无法计算仿射变换，返回原图")
                     return (target_image, torch.zeros(1, target_image.shape[1], target_image.shape[2]), target_image)
+                
+                # 【优化】基于重投影误差过滤低质量匹配点后重新计算
+                inliers_corrected = np.sum(ransac_mask)
+                print(f"修正后RANSAC内点数量: {inliers_corrected}/{len(good_matches)}")
+                
+                inlier_mask_corrected = ransac_mask.ravel() == 1
+                src_inliers_corrected = src_pts[inlier_mask_corrected]
+                dst_inliers_corrected = dst_pts[inlier_mask_corrected]
+                
+                # 计算所有内点的重投影误差
+                transformed_corrected = cv2.transform(src_inliers_corrected, affine_matrix)
+                errors_corrected = np.linalg.norm(transformed_corrected - dst_inliers_corrected, axis=2).ravel()
+                
+                # 只保留误差最小的80%点
+                threshold_80_corrected = np.percentile(errors_corrected, 80)
+                good_mask_corrected = errors_corrected <= threshold_80_corrected
+                refined_count_corrected = np.sum(good_mask_corrected)
+                
+                print(f"🔧 修正后重投影误差过滤: 保留{refined_count_corrected}/{inliers_corrected}个最优内点 (80%分位)")
+                
+                # 用最优点重新计算仿射矩阵
+                if refined_count_corrected >= 3:
+                    src_pts_refined_corrected = src_inliers_corrected[good_mask_corrected]
+                    dst_pts_refined_corrected = dst_inliers_corrected[good_mask_corrected]
+                    affine_matrix_refined_corrected, _ = cv2.estimateAffine2D(
+                        src_pts_refined_corrected, 
+                        dst_pts_refined_corrected,
+                        method=cv2.LMEDS
+                    )
+                    
+                    if affine_matrix_refined_corrected is not None:
+                        affine_matrix = affine_matrix_refined_corrected
+                        print("✓ 已使用修正后精化的仿射矩阵")
+                        
+                        # 更新ransac_mask
+                        temp_mask_corrected = np.zeros(len(good_matches), dtype=bool)
+                        inlier_indices_corrected = np.where(inlier_mask_corrected)[0]
+                        refined_indices_corrected = inlier_indices_corrected[good_mask_corrected]
+                        temp_mask_corrected[refined_indices_corrected] = True
+                        ransac_mask = temp_mask_corrected.reshape(-1, 1).astype(np.uint8)
                 
                 # 验证修正效果（基于RANSAC内点）
                 inlier_mask_new = ransac_mask.ravel() == 1
@@ -372,57 +451,19 @@ class PixelSnappingNode:
         h1, w1 = ref_img_uint8.shape[:2]
         h2, w2 = tgt_img_uint8.shape[:2]
         
-        # 计算变换后图2的边界框，以确定需要的画布大小
-        # 获取图2的四个角点
-        corners = np.array([
-            [0, 0],
-            [w2, 0],
-            [w2, h2],
-            [0, h2]
-        ], dtype=np.float32).reshape(-1, 1, 2)
+        # 使用图1作为画布尺寸（确保输出尺寸与图1一致）
+        canvas_w = w1
+        canvas_h = h1
         
-        # 应用仿射变换到角点
-        transformed_corners = cv2.transform(corners, affine_matrix).reshape(-1, 2)
+        print(f"画布尺寸（使用图1尺寸）: {canvas_w}×{canvas_h}")
         
-        # 计算变换后的边界（包含图1和变换后的图2）
-        all_corners = np.vstack([
-            [[0, 0], [w1, 0], [w1, h1], [0, h1]],  # 图1的角点
-            transformed_corners  # 变换后图2的角点
-        ])
+        # 创建画布，直接使用图1作为底图
+        canvas = ref_img_uint8.copy()
         
-        min_x = np.min(all_corners[:, 0])
-        max_x = np.max(all_corners[:, 0])
-        min_y = np.min(all_corners[:, 1])
-        max_y = np.max(all_corners[:, 1])
-        
-        # 计算最终画布尺寸（能容纳两图的最小矩形）
-        canvas_w = int(np.ceil(max_x - min_x))
-        canvas_h = int(np.ceil(max_y - min_y))
-        
-        print(f"画布尺寸: {canvas_w}×{canvas_h}")
-        
-        # 调整变换矩阵以适应新的画布偏移
-        translation = np.array([
-            [1, 0, -min_x],
-            [0, 1, -min_y]
-        ], dtype=np.float32)
-        adjusted_matrix = translation @ np.vstack([affine_matrix, [0, 0, 1]])
-        adjusted_matrix = adjusted_matrix[:2, :]
-        
-        # 创建画布
-        canvas = np.zeros((canvas_h, canvas_w, ref_img_uint8.shape[2]), dtype=np.uint8)
-        
-        # 计算图1在画布上的位置
-        ref_x_offset = int(-min_x)
-        ref_y_offset = int(-min_y)
-        
-        # 将图1放到画布上
-        canvas[ref_y_offset:ref_y_offset+h1, ref_x_offset:ref_x_offset+w1] = ref_img_uint8
-        
-        # 对图2应用仿射变换到画布上
+        # 对图2应用仿射变换到画布上（直接变换到图1的坐标系）
         aligned_img_uint8 = cv2.warpAffine(
             tgt_img_uint8,
-            adjusted_matrix,
+            affine_matrix,
             (canvas_w, canvas_h),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
@@ -449,10 +490,10 @@ class PixelSnappingNode:
             if invert_input_mask:
                 input_mask = 1.0 - input_mask
             
-            # 将遮罩变换到画布上
+            # 将遮罩变换到画布上（使用原始affine_matrix）
             mask_2d = cv2.warpAffine(  # type: ignore
                 input_mask,
-                adjusted_matrix,
+                affine_matrix,
                 (canvas_w, canvas_h),
                 flags=cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_CONSTANT,
@@ -464,10 +505,10 @@ class PixelSnappingNode:
             h2, w2 = tgt_img_uint8.shape[:2]
             full_mask = np.ones((h2, w2), dtype=np.float32)
             
-            # 将完整遮罩变换到画布上
+            # 将完整遮罩变换到画布上（使用原始affine_matrix）
             mask_2d = cv2.warpAffine(  # type: ignore
                 full_mask,
-                adjusted_matrix,
+                affine_matrix,
                 (canvas_w, canvas_h),
                 flags=cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_CONSTANT,
